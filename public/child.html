@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <!-- ピンチズーム対応 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <title>児童用 - Whiteboard</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; box-sizing: border-box;
+      width: 100%; height: 100%; background: #ddd;
+      overflow: hidden; font-family: sans-serif;
+    }
+    /* ツールバー */
+    #toolbar {
+      position: absolute; top: 0; left: 0; right: 0;
+      display: flex; flex-wrap: wrap; gap: 8px;
+      justify-content: center; align-items: center;
+      background: rgba(0,0,0,0.2); padding: 4px; z-index: 10;
+    }
+    #toolbar button, #toolbar label {
+      padding: 8px; cursor: pointer;
+      background: #008b8b; color: white;
+      border: none; border-radius: 4px; font-size: 14px;
+    }
+    /* 使用中のツールボタン（mousedownで即 active） */
+    #toolbar button.active {
+      background: darkorange;
+    }
+    #toolbar button:hover, #toolbar label:hover { background: #006868; }
+    #photoInput { display: none; }
+    /* 追加：写真サイズモードボタン */
+    #photoSizeBtn {
+      padding: 8px; cursor: pointer;
+      background: #008b8b; color: white;
+      border: none; border-radius: 4px; font-size: 14px;
+    }
+    #photoSizeBtn.active {
+      background: darkorange;
+    }
+    /* キャンバスコンテナ（固定サイズ800×600） */
+    #canvasContainer {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 800px; height: 600px;
+      border: 2px solid #aaa; background: #fff;
+      position: relative;
+    }
+    /* 下層：写真用キャンバス */
+    #photoCanvas,
+    /* 上層：描画用キャンバス */
+    #drawCanvas {
+      position: absolute; top: 0; left: 0;
+      width: 800px; height: 600px;
+      touch-action: none;
+    }
+    #photoCanvas { z-index: 1; }
+    #drawCanvas { z-index: 2; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="penBlack">⚫️</button>
+    <button id="penRed">🔴</button>
+    <button id="penBlue">🔵</button>
+    <button id="eraserBtn">けしゴム</button>
+    <button id="undoBtn">←もどる</button>
+    <button id="redoBtn">すすむ→</button>
+    <button id="clearLocalBtn">ぜんぶけす</button>
+    <label for="photoInput" id="photoLabel">しゃしん</label>
+    <input type="file" accept="image/*" id="photoInput">
+    <!-- 新規追加：写真サイズモードボタン -->
+    <button id="photoSizeBtn">写真サイズ: 元</button>
+    <button id="lassoBtn">投げ縄ツール</button>
+  </div>
+
+  <div id="canvasContainer">
+    <canvas id="photoCanvas" width="800" height="600"></canvas>
+    <canvas id="drawCanvas" width="800" height="600"></canvas>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    /*********************
+     * 基本設定
+     *********************/
+    const roomID = prompt("ルームID?") || "";
+    const userID = prompt("あなたの名前?") || "";
+    let joined = (roomID && userID) ? true : false;
+    let isLocked = false;
+    let currentColor = "black";
+    let drawing = false;
+    
+    const photoCanvas = document.getElementById("photoCanvas");
+    const photoCtx = photoCanvas.getContext("2d");
+    const drawCanvas = document.getElementById("drawCanvas");
+    const drawCtx = drawCanvas.getContext("2d");
+    
+    photoCanvas.width = 800; photoCanvas.height = 600;
+    drawCanvas.width = 800; drawCanvas.height = 600;
+    
+    let paths = [];        // 描画線の配列
+    let undoStack = [];    // スナップショット配列
+    let redoStack = [];
+    
+    // 写真情報：各オブジェクトは { img, imgSrc, x, y, width, height, scale }
+    let photoObjs = [];
+    
+    // 写真サイズモード： true = キャンバスフィット, false = 元サイズ
+    let photoFitMode = false;
+    document.getElementById("photoSizeBtn").addEventListener("mousedown", () => {
+      photoFitMode = !photoFitMode;
+      document.getElementById("photoSizeBtn").textContent = photoFitMode ? "写真サイズ: フィット" : "写真サイズ: 元";
+      document.getElementById("photoSizeBtn").classList.toggle("active", photoFitMode);
+    });
+    
+    /*********************
+     * 投げ縄ツール用（矩形選択）
+     *********************/
+    let isLassoMode = false;
+    let isDraggingRect = false;
+    let selectRect = null;            // 現在の選択矩形 { x, y, w, h }
+    let selectRectOrig = null;        // pointerdown 時の選択矩形（固定原点とサイズ）
+    let selectMode = null;            // "move" または "scale"
+    let lastDragPos = null;           // 前回のポインタ位置（インクリメンタル更新用）
+    let selectedPaths = [];
+    let selectedPhotos = [];
+    
+    const socket = io();
+    if (joined) {
+      socket.emit("joinRoom", { roomID, userID, isTeacher: false });
+    }
+    
+    /*********************
+     * ツールバーイベント（mousedownで即 active）
+     *********************/
+    function updateToolButtons(activeId) {
+      const btnIds = ["penBlack", "penRed", "penBlue", "eraserBtn", "lassoBtn"];
+      btnIds.forEach(id => {
+        const btn = document.getElementById(id);
+        if (id === activeId) {
+          btn.classList.add("active");
+        } else {
+          btn.classList.remove("active");
+        }
+      });
+    }
+    document.getElementById("penBlack").addEventListener("mousedown", () => {
+      currentColor = "black";
+      updateToolButtons("penBlack");
+    });
+    document.getElementById("penRed").addEventListener("mousedown", () => {
+      currentColor = "red";
+      updateToolButtons("penRed");
+    });
+    document.getElementById("penBlue").addEventListener("mousedown", () => {
+      currentColor = "blue";
+      updateToolButtons("penBlue");
+    });
+    document.getElementById("eraserBtn").addEventListener("mousedown", () => {
+      currentColor = "white";
+      updateToolButtons("eraserBtn");
+    });
+    document.getElementById("lassoBtn").addEventListener("mousedown", () => {
+      isLassoMode = !isLassoMode;
+      // 初回使用時、もし選択矩形が null なら初期値を設定（例：50,50,50,50）
+      if (isLassoMode && !selectRect) {
+        selectRect = { x: 50, y: 50, w: 50, h: 50 };
+      }
+      selectRectOrig = null;
+      lastDragPos = null;
+      selectedPaths = [];
+      selectedPhotos = [];
+      updateToolButtons("lassoBtn");
+      document.getElementById("lassoBtn").textContent = isLassoMode ? "投げ縄ツールON" : "投げ縄ツールOFF";
+      redraw();
+    });
+    document.getElementById("undoBtn").addEventListener("click", undoLocal);
+    document.getElementById("redoBtn").addEventListener("click", redoLocal);
+    document.getElementById("clearLocalBtn").addEventListener("click", () => {
+      clearLocal();
+      socket.emit("syncPaths", { roomID, studentId: userID, allPaths: paths });
+      socket.emit("syncPhotos", { roomID, studentId: userID, photoObjs: photoObjs });
+    });
+    const photoInput = document.getElementById("photoInput");
+    photoInput.addEventListener("change", handlePhotoSelect);
+    
+    /*********************
+     * pointerイベント（drawCanvas用）
+     *********************/
+    drawCanvas.addEventListener("pointerdown", onPointerDown);
+    drawCanvas.addEventListener("pointermove", onPointerMove);
+    drawCanvas.addEventListener("pointerup", onPointerUp);
+    function getPos(e) {
+      const rect = drawCanvas.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    }
+    
+    function onPointerDown(e) {
+      if (!joined || isLocked) return;
+      const pos = getPos(e);
+      if (isLassoMode) {
+        if (selectRect && isInRect(pos, selectRect)) {
+          const handleSize = 20;
+          const rx = selectRect.x + selectRect.w - handleSize;
+          const ry = selectRect.y + selectRect.h - handleSize;
+          if (pos.x >= rx && pos.y >= ry) {
+            selectMode = "scale";
+            selectRectOrig = { ...selectRect };
+          } else {
+            selectMode = "move";
+          }
+          lastDragPos = { ...pos };
+          return;
+        }
+        recordSnapshot();
+        selectRect = { x: pos.x, y: pos.y, w: 0, h: 0 };
+        isDraggingRect = true;
+        lastDragPos = { ...pos };
+        redraw();
+        return;
+      }
+      recordSnapshot();
+      drawing = true;
+      paths.push({ color: currentColor, points: [pos] });
+      redraw();
+    }
+    
+    function onPointerMove(e) {
+      if (!joined || isLocked) return;
+      const pos = getPos(e);
+      if (isLassoMode) {
+        if (isDraggingRect && selectRect) {
+          selectRect.w = pos.x - selectRect.x;
+          selectRect.h = pos.y - selectRect.y;
+          redraw();
+          return;
+        }
+        if (selectMode === "move" && lastDragPos) {
+          let dx = pos.x - lastDragPos.x;
+          let dy = pos.y - lastDragPos.y;
+          selectRect.x += dx;
+          selectRect.y += dy;
+          moveSelectedObjects(dx, dy);
+          lastDragPos = { ...pos };
+          redraw();
+          return;
+        }
+        if (selectMode === "scale" && lastDragPos && selectRectOrig) {
+          // 前回との差分でインクリメンタル更新
+          let dx = pos.x - lastDragPos.x;
+          let dy = pos.y - lastDragPos.y;
+          // 計算：元の選択矩形幅・高さに対する差分割合
+          let factorX = 1 + dx / selectRectOrig.w;
+          let factorY = 1 + dy / selectRectOrig.h;
+          let uniformFactor = Math.min(factorX, factorY);
+          // 更新：選択矩形をインクリメンタル更新
+          selectRect.w *= uniformFactor;
+          selectRect.h *= uniformFactor;
+          // 対象オブジェクトも同じ倍率で更新（固定原点は selectRect.x, selectRect.y）
+          scaleSelectedObjects(uniformFactor, uniformFactor, selectRect.x, selectRect.y);
+          lastDragPos = { ...pos };
+          redraw();
+          return;
+        }
+      }
+      if (drawing) {
+        paths[paths.length - 1].points.push(pos);
+        redraw();
+      }
+    }
+    
+    function onPointerUp(e) {
+      if (!joined || isLocked) return;
+      if (isLassoMode) {
+        if (isDraggingRect) {
+          isDraggingRect = false;
+          finalizeSelectionRect();
+          recordSnapshot();
+          socket.emit("syncLasso", { roomID, studentId: userID, selectRect: selectRect });
+          socket.emit("syncPhotos", { roomID, studentId: userID, photoObjs: photoObjs });
+          console.log("syncLasso emit:", selectRect);
+          return;
+        }
+        if (selectMode) {
+          recordSnapshot();
+          socket.emit("syncLasso", { roomID, studentId: userID, selectRect: selectRect });
+          socket.emit("syncPhotos", { roomID, studentId: userID, photoObjs: photoObjs });
+          console.log("syncLasso emit:", selectRect);
+          selectMode = null;
+          lastDragPos = null;
+          return;
+        }
+      }
+      if (drawing) {
+        drawing = false;
+        recordSnapshot();
+      }
+    }
+    
+    function finalizeSelectionRect() {
+      if (!selectRect) return;
+      let rx = selectRect.w >= 0 ? selectRect.x : selectRect.x + selectRect.w;
+      let ry = selectRect.h >= 0 ? selectRect.y : selectRect.y + selectRect.h;
+      let rw = Math.abs(selectRect.w);
+      let rh = Math.abs(selectRect.h);
+      selectRect = { x: rx, y: ry, w: rw, h: rh };
+      selectedPaths = [];
+      for (let p of paths) {
+        let bb = getLineBoundingBox(p);
+        if (isRectFullyInsideRect(bb, selectRect)) {
+          selectedPaths.push(p);
+        }
+      }
+      selectedPhotos = [];
+      for (let obj of photoObjs) {
+        let w = obj.width * obj.scale;
+        let h = obj.height * obj.scale;
+        let bx = { x: obj.x, y: obj.y, w, h };
+        if (isRectFullyInsideRect(bx, selectRect)) {
+          selectedPhotos.push(obj);
+        }
+      }
+    }
+    
+    function moveSelectedObjects(dx, dy) {
+      for (let p of selectedPaths) {
+        for (let pt of p.points) {
+          pt.x += dx;
+          pt.y += dy;
+        }
+      }
+      for (let obj of selectedPhotos) {
+        obj.x += dx;
+        obj.y += dy;
+      }
+    }
+    
+    function scaleSelectedObjects(sx, sy, ox, oy) {
+      for (let p of selectedPaths) {
+        for (let pt of p.points) {
+          let dx = pt.x - ox, dy = pt.y - oy;
+          pt.x = ox + dx * sx;
+          pt.y = oy + dy * sy;
+        }
+      }
+      for (let obj of selectedPhotos) {
+        let dx = obj.x - ox, dy = obj.y - oy;
+        obj.x = ox + dx * sx;
+        obj.y = oy + dy * sy;
+        obj.scale *= sx; // sx と sy は同じ倍率
+        if (obj.scale < 0.05) obj.scale = 0.05;
+        if (obj.scale > 5) obj.scale = 5;
+      }
+    }
+    
+    /*********************
+     * 写真追加
+     *********************/
+    function handlePhotoSelect(e) {
+      console.log("handlePhotoSelect fired");
+      const file = e.target.files[0];
+      if (!file) return;
+      if (photoObjs.length >= 4) {
+        alert("写真は最大4枚まで！");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = ev => {
+        processImage(ev.target.result);
+      };
+      reader.onerror = err => {
+        console.error("FileReader エラー", err);
+        const fallbackURL = URL.createObjectURL(file);
+        processImage(fallbackURL);
+      };
+      try {
+        reader.readAsDataURL(file);
+      } catch (err) {
+        console.error("readAsDataURL 例外", err);
+        const fallbackURL = URL.createObjectURL(file);
+        processImage(fallbackURL);
+      }
+      e.target.value = "";
+    }
+    
+    function processImage(dataURL) {
+      let img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        let p = {
+          img: img,
+          imgSrc: dataURL,
+          x: 40 + photoObjs.length * 30,
+          y: 40 + photoObjs.length * 30,
+          width: img.width,
+          height: img.height,
+          scale: 0.1
+        };
+        if (photoFitMode) {
+          let factor = Math.min(800 / img.width, 600 / img.height);
+          p.scale = factor;
+          p.x = 0;
+          p.y = 0;
+        }
+        photoObjs.push(p);
+        recordSnapshot();
+        redraw();
+        setTimeout(() => {
+          socket.emit("syncPhotos", { roomID, studentId: userID, photoObjs: photoObjs });
+          console.log("syncPhotos emit:", p);
+        }, 500);
+      };
+      img.onerror = err => {
+        console.error("画像の読み込みエラー", err);
+      };
+      img.src = dataURL;
+    }
+    
+    /*********************
+     * 描画（2層構造）
+     *********************/
+    function redraw() {
+      // 下層：写真レイヤー
+      photoCtx.clearRect(0, 0, photoCanvas.width, photoCanvas.height);
+      photoCtx.fillStyle = "#ffffff";
+      photoCtx.fillRect(0, 0, photoCanvas.width, photoCanvas.height);
+      for (let p of photoObjs) {
+        let w = p.width * p.scale;
+        let h = p.height * p.scale;
+        photoCtx.drawImage(p.img, p.x, p.y, w, h);
+      }
+      // 上層：描画レイヤー（線）
+      drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+      for (let path of paths) {
+        if (path.color === "white") {
+          drawCtx.globalCompositeOperation = "destination-out";
+          drawCtx.lineWidth = 8;
+        } else {
+          drawCtx.globalCompositeOperation = "source-over";
+          drawCtx.lineWidth = 3;
+          drawCtx.strokeStyle = path.color;
+        }
+        drawCtx.lineCap = "round";
+        drawCtx.beginPath();
+        if (path.points.length === 0) continue;
+        drawCtx.moveTo(path.points[0].x, path.points[0].y);
+        for (let i = 1; i < path.points.length; i++) {
+          drawCtx.lineTo(path.points[i].x, path.points[i].y);
+        }
+        drawCtx.stroke();
+      }
+      // ＊児童側では、投げ縄ツール使用中は常に破線の選択矩形と右下ハンドルを表示
+      if (isLassoMode && selectRect) {
+        drawCtx.save();
+        drawCtx.strokeStyle = "blue";
+        drawCtx.setLineDash([5, 5]);
+        drawCtx.lineWidth = 2;
+        drawCtx.strokeRect(selectRect.x, selectRect.y, selectRect.w, selectRect.h);
+        drawCtx.fillStyle = "blue";
+        drawCtx.fillRect(selectRect.x + selectRect.w - 10, selectRect.y + selectRect.h - 10, 10, 10);
+        drawCtx.restore();
+      }
+      // 名前表示
+      drawCtx.font = "20px sans-serif";
+      drawCtx.fillStyle = "rgba(0,0,0,0.5)";
+      drawCtx.fillText(userID, 10, 30);
+    }
+    
+    /*********************
+     * Undo/Redo
+     *********************/
+    function recordSnapshot() {
+      let snap = JSON.parse(JSON.stringify({ paths, photoObjs, selectRect }));
+      undoStack.push(snap);
+      redoStack = [];
+    }
+    function undoLocal() {
+      if (undoStack.length < 2) return;
+      let popped = undoStack.pop();
+      redoStack.push(popped);
+      let prev = undoStack[undoStack.length - 1];
+      applySnapshot(prev);
+    }
+    function redoLocal() {
+      if (redoStack.length < 1) return;
+      let popped = redoStack.pop();
+      undoStack.push(popped);
+      applySnapshot(popped);
+    }
+    function applySnapshot(snap) {
+      paths = JSON.parse(JSON.stringify(snap.paths));
+      photoObjs = JSON.parse(JSON.stringify(snap.photoObjs));
+      photoObjs.forEach(photo => {
+        if (photo.imgSrc) {
+          let img = new Image();
+          img.src = photo.imgSrc;
+          photo.img = img;
+        }
+      });
+      selectRect = snap.selectRect ? { ...snap.selectRect } : null;
+      redraw();
+    }
+    function clearLocal() {
+      if (!joined || isLocked) return;
+      recordSnapshot();
+      paths = [];
+      photoObjs = [];
+      selectRect = null;
+      redraw();
+      recordSnapshot();
+    }
+    
+    /*********************
+     * ヘルパー関数
+     *********************/
+    function isInRect(pt, rect) {
+      let x1 = rect.w >= 0 ? rect.x : rect.x + rect.w;
+      let y1 = rect.h >= 0 ? rect.y : rect.y + rect.h;
+      let w = Math.abs(rect.w), h = Math.abs(rect.h);
+      return (pt.x >= x1 && pt.x <= x1 + w && pt.y >= y1 && pt.y <= y1 + h);
+    }
+    function getLineBoundingBox(path) {
+      let xs = path.points.map(p => p.x);
+      let ys = path.points.map(p => p.y);
+      let minx = Math.min(...xs), maxx = Math.max(...xs);
+      let miny = Math.min(...ys), maxy = Math.max(...ys);
+      return { x: minx, y: miny, w: maxx - minx, h: maxy - miny };
+    }
+    function isRectFullyInsideRect(r1, r2) {
+      let x1 = r1.x, y1 = r1.y, w1 = r1.w, h1 = r1.h;
+      let x2 = r2.x, y2 = r2.y, w2 = r2.w, h2 = r2.h;
+      if (w2 < 0) { x2 += w2; w2 = -w2; }
+      if (h2 < 0) { y2 += h2; h2 = -h2; }
+      if (w1 < 0) { x1 += w1; w1 = -w1; }
+      if (h1 < 0) { y1 += h1; h1 = -h1; }
+      return (x1 >= x2 && (x1 + w1) <= (x2 + w2) && y1 >= y2 && (y1 + h1) <= (y2 + h2));
+    }
+    
+    // 定期的に線データを送信（5秒ごと）
+    setInterval(() => {
+      console.log("Emitting syncPaths:", paths);
+      if (!joined || isLocked) return;
+      socket.emit("syncPaths", { roomID, studentId: userID, allPaths: paths });
+    }, 5000);
+    
+    // ----- LOCK STATE パッチ（貼り付けるだけで動作する追加コード） -----
+    socket.on("lockState", ({ studentId, locked }) => {
+      console.log("lockState received:", studentId, locked);
+      if (studentId === userID) {
+        isLocked = locked;
+        redraw();
+      }
+    });
+    
+    // 起動時
+    recordSnapshot();
+    redraw();
+  </script>
+</body>
+</html>

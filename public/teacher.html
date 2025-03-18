@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <!-- pinch-zoom -->
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=yes">
+  <title>教師管理画面 - Whiteboard Monitor</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      width: 100%;
+      height: 100%;
+      overscroll-behavior: none;
+      touch-action: auto;
+      background: #fffaf0;
+      font-family: sans-serif;
+    }
+    h1 { margin: 8px 0; }
+    #toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin: 8px;
+    }
+    #toolbar input {
+      width: 90px;
+      padding: 4px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+    }
+    #toolbar button {
+      padding: 8px 12px;
+      cursor: pointer;
+      background: #5f9ea0;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      transition: background 0.3s;
+    }
+    #toolbar button:hover { background: #4a7e81; }
+    /* 追加：非表示ボタン */
+    #hideSelectedBtn {
+      padding: 8px 12px;
+      cursor: pointer;
+      background: #5f9ea0;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      transition: background 0.3s;
+    }
+    #hideSelectedBtn:hover { background: #4a7e81; }
+    #studentsContainer {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+      width: 90%;
+      max-width: 1000px;
+      margin-bottom: 16px;
+    }
+    .studentCard {
+      border: 2px solid #ccc;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: #fff;
+      border-radius: 6px;
+      user-select: none;
+    }
+    .studentCard.selected {
+      border-color: #ff6347;
+      box-shadow: 0 0 10px rgba(255,99,71,0.5);
+    }
+    .studentCanvas {
+      border: 1px solid #333;
+      width: 200px;
+      height: 150px;
+      margin-bottom: 6px;
+    }
+    .lockStatus { color: red; font-weight: bold; }
+    .stuName { margin: 0; padding: 0; color: #333; }
+    /* Overlay */
+    #displayOverlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0,0,0,0.5);
+      display: none;
+      z-index: 9999;
+      touch-action: pan-x pan-y pinch-zoom;
+      overscroll-behavior: none;
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      padding-top: 50px;
+    }
+    #closeDisplayBtn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-size: 24px;
+      cursor: pointer;
+      background: #ff4444;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 8px;
+    }
+    #displayContainer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      min-width: 1200px;
+      min-height: 800px;
+      margin: 0 auto;
+    }
+    .displayCanvas {
+      background: #fff;
+      border: 2px solid #fff;
+      border-radius: 6px;
+      width: 400px;
+      height: 300px;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h1>教師管理画面 - Whiteboard Monitor</h1>
+  <div id="toolbar">
+    <input id="roomInput" type="text" placeholder="ルームID">
+    <input id="teacherInput" type="text" placeholder="TeacherID">
+    <button id="joinBtn">参加</button>
+    <!-- 「全員クリア」ボタンは削除 -->
+    <button id="toggleLockBtn">一括ロック</button>
+    <button id="latestBtn">最新情報取得</button>
+    <button id="resetRoomBtn">ルームリセット</button>
+    <button id="showBtn">表示</button>
+    <button id="toggleNameBtn">名前表示 ON</button>
+    <button id="hideSelectedBtn">非表示</button>
+  </div>
+  <div id="studentsContainer"></div>
+  <div id="displayOverlay">
+    <button id="closeDisplayBtn">×</button>
+    <div id="displayContainer"></div>
+  </div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let roomID = "", teacherID = "";
+    let studentCanvases = {};  // { studentId: canvas context }
+    let studentCards = {};
+    let studentTitles = {};
+    let allLocked = false;
+    let hideNames = false;
+    // 非表示状態の生徒IDを保持するためのセット
+    let hiddenStudents = new Set();
+    // teacherRoomData：各生徒の { paths, photos, selectRect, locked } を保持
+    let teacherRoomData = {};
+    
+    const displayOverlay = document.getElementById("displayOverlay");
+    const displayContainer = document.getElementById("displayContainer");
+    
+    document.getElementById("closeDisplayBtn").addEventListener("click", () => {
+      displayOverlay.style.display = "none";
+      displayContainer.innerHTML = "";
+    });
+    const toggleNameBtn = document.getElementById("toggleNameBtn");
+    toggleNameBtn.addEventListener("click", () => {
+      hideNames = !hideNames;
+      toggleNameBtn.textContent = hideNames ? "名前表示 OFF" : "名前表示 ON";
+      updateNameVisibility();
+    });
+    document.getElementById("joinBtn").addEventListener("click", () => {
+      roomID = document.getElementById("roomInput").value.trim();
+      teacherID = document.getElementById("teacherInput").value.trim();
+      if (!roomID || !teacherID) {
+        alert("ルームID / TeacherIDを入力");
+        return;
+      }
+      socket.emit("joinRoom", { roomID, userID: teacherID, isTeacher: true });
+    });
+    document.getElementById("toggleLockBtn").addEventListener("click", () => {
+      allLocked = !allLocked;
+      toggleLockBtn.textContent = allLocked ? "一括ロック解除" : "一括ロック";
+      socket.emit("getStudents", roomID);
+    });
+    socket.on("studentsList", (list) => {
+      console.log("studentsList received:", list);
+      list.forEach(studentId => {
+        console.log(`ロック送信: studentId=${studentId}, locked=${allLocked}`);
+        socket.emit("lock", { roomID, studentId, locked: allLocked });
+      });
+    });
+    document.getElementById("latestBtn").addEventListener("click", () => {
+      socket.emit("getStudents", roomID);
+      socket.emit("getAllData", roomID);
+    });
+    document.getElementById("resetRoomBtn").addEventListener("click", () => {
+      if (confirm("本当にリセットしますか？")) {
+        socket.emit("resetRoom", roomID);
+      }
+    });
+    document.getElementById("showBtn").addEventListener("click", () => {
+      const sel = getSelectedIds();
+      if (sel.length < 1) {
+        alert("1人以上を選択してください");
+        return;
+      }
+      displayOverlay.style.display = "flex";
+      displayContainer.innerHTML = "";
+      showSelectedBoards(teacherRoomData);
+    });
+    // 非表示ボタン：選択した生徒カードを非表示状態にする
+    document.getElementById("hideSelectedBtn").addEventListener("click", () => {
+      const sel = getSelectedIds();
+      if (sel.length < 1) {
+        alert("非表示にする生徒を1人以上選択してください");
+        return;
+      }
+      sel.forEach(studentId => {
+        if (studentCards[studentId]) {
+          studentCards[studentId].style.display = "none";
+          hiddenStudents.add(studentId);
+        }
+      });
+    });
+    
+    // 受信：syncPaths（線データ）
+    socket.on("syncPaths", ({ studentId, allPaths }) => {
+      console.log("syncPaths received from", studentId, allPaths);
+      if (!studentCanvases[studentId]) {
+        createStudentCard(studentId);
+      }
+      if (!teacherRoomData[studentId]) teacherRoomData[studentId] = {};
+      teacherRoomData[studentId].paths = allPaths;
+      redrawThumb(studentId, teacherRoomData[studentId]);
+    });
+    socket.on("clearAll", () => {
+      teacherRoomData = {};
+      updateStudentList({});
+    });
+    socket.on("clearOne", (targetId) => {
+      if (studentCanvases[targetId]) {
+        studentCanvases[targetId].clearRect(0, 0, 200, 150);
+      }
+    });
+    // 受信：allData（全データ）
+    socket.on("allData", (data) => {
+      console.log("allData received:", data);
+      for (let id in teacherRoomData) {
+        if (teacherRoomData[id].locked !== undefined) {
+          data[id] = data[id] || {};
+          data[id].locked = teacherRoomData[id].locked;
+        }
+      }
+      teacherRoomData = data;
+      updateStudentList(data);
+    });
+    socket.on("studentsList", (list) => {
+      socket.emit("getAllData", roomID);
+    });
+    // 受信：lockState イベント
+    socket.on("lockState", ({ studentId, locked }) => {
+      console.log("lockState 受信:", studentId, locked);
+      if (!teacherRoomData[studentId]) teacherRoomData[studentId] = {};
+      teacherRoomData[studentId].locked = locked;
+      if (studentCards[studentId]) {
+        let lockSpan = studentCards[studentId].querySelector(".lockStatus");
+        if (lockSpan) {
+          lockSpan.textContent = locked ? "LOCKED" : "";
+        }
+      }
+    });
+    // 受信：syncPhotos（写真情報）
+    socket.on("syncPhotos", ({ studentId, photoObjs }) => {
+      console.log("syncPhotos received from", studentId, photoObjs);
+      if (!teacherRoomData[studentId]) {
+        teacherRoomData[studentId] = {};
+      }
+      teacherRoomData[studentId].photos = photoObjs;
+      updateStudentPhoto(studentId);
+    });
+    // 受信：syncLasso（投げ縄選択矩形）は教師側では無視
+    socket.on("syncLasso", ({ studentId, selectRect }) => {
+      console.log("syncLasso received from", studentId, selectRect);
+    });
+    
+    function updateStudentPhoto(studentId) {
+      if (studentCanvases[studentId] && teacherRoomData[studentId]) {
+        redrawThumb(studentId, teacherRoomData[studentId]);
+      }
+    }
+    
+    // redrawThumb：オフスクリーンキャンバスを使い、写真（背景）＋線を合成（教師側は投げ縄破線は表示しない）
+    function redrawThumb(studentId, data) {
+      if (!data) {
+        console.warn("redrawThumb: no data for", studentId);
+        data = {};
+      }
+      const ctx = studentCanvases[studentId];
+      if (!ctx) return;
+      const thumbWidth = 200, thumbHeight = 150;
+      
+      const photoOff = document.createElement("canvas");
+      photoOff.width = thumbWidth;
+      photoOff.height = thumbHeight;
+      const photoCtxOff = photoOff.getContext("2d");
+      photoCtxOff.fillStyle = "#ffffff";
+      photoCtxOff.fillRect(0, 0, thumbWidth, thumbHeight);
+      if (data.photos && Array.isArray(data.photos)) {
+        data.photos.forEach(ph => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.src = ph.imgSrc;
+          if (img.complete) {
+            const w = ph.width * ph.scale * (thumbWidth / 800);
+            const h = ph.height * ph.scale * (thumbHeight / 600);
+            const x = ph.x * (thumbWidth / 800);
+            const y = ph.y * (thumbHeight / 600);
+            photoCtxOff.drawImage(img, x, y, w, h);
+          } else {
+            img.onload = () => { redrawThumb(studentId, data); };
+          }
+        });
+      }
+      
+      const drawOff = document.createElement("canvas");
+      drawOff.width = thumbWidth;
+      drawOff.height = thumbHeight;
+      const drawCtxOff = drawOff.getContext("2d");
+      drawCtxOff.clearRect(0, 0, thumbWidth, thumbHeight);
+      if (data.paths && Array.isArray(data.paths)) {
+        data.paths.forEach(p => {
+          drawCtxOff.lineCap = "round";
+          if (p.color === "white") {
+            drawCtxOff.globalCompositeOperation = "destination-out";
+            drawCtxOff.lineWidth = 8;
+          } else {
+            drawCtxOff.globalCompositeOperation = "source-over";
+            drawCtxOff.lineWidth = 3;
+            drawCtxOff.strokeStyle = p.color;
+          }
+          drawCtxOff.beginPath();
+          if (!p.points || p.points.length === 0) return;
+          drawCtxOff.moveTo(p.points[0].x * (thumbWidth / 800), p.points[0].y * (thumbHeight / 600));
+          for (let i = 1; i < p.points.length; i++) {
+            drawCtxOff.lineTo(p.points[i].x * (thumbWidth / 800), p.points[i].y * (thumbHeight / 600));
+          }
+          drawCtxOff.stroke();
+        });
+      }
+      
+      const finalOff = document.createElement("canvas");
+      finalOff.width = thumbWidth;
+      finalOff.height = thumbHeight;
+      const finalCtx = finalOff.getContext("2d");
+      finalCtx.drawImage(photoOff, 0, 0);
+      finalCtx.drawImage(drawOff, 0, 0);
+      
+      ctx.clearRect(0, 0, thumbWidth, thumbHeight);
+      ctx.drawImage(finalOff, 0, 0);
+    }
+    
+    // 生徒カード生成（teacherRoomData を初期化）
+    function createStudentCard(studentId, data) {
+      data = data || {};
+      teacherRoomData[studentId] = data;
+      
+      const container = document.getElementById("studentsContainer");
+      const card = document.createElement("div");
+      card.className = "studentCard";
+      const title = document.createElement("p");
+      title.className = "stuName";
+      title.textContent = `ID: ${studentId}`;
+      card.appendChild(title);
+      studentTitles[studentId] = title;
+      const lockSpan = document.createElement("span");
+      lockSpan.className = "lockStatus";
+      if (data.locked) {
+        lockSpan.textContent = "LOCKED";
+      }
+      card.appendChild(lockSpan);
+      const c = document.createElement("canvas");
+      c.width = 200;
+      c.height = 150;
+      c.classList.add("studentCanvas");
+      card.appendChild(c);
+      studentCards[studentId] = card;
+      container.appendChild(card);
+      const ctx = c.getContext("2d");
+      studentCanvases[studentId] = ctx;
+      redrawThumb(studentId, data);
+      // ★ 過去に非表示状態にしている生徒は非表示のまま
+      if (hiddenStudents.has(studentId)) {
+        card.style.display = "none";
+      }
+      card.addEventListener("click", () => {
+        card.classList.toggle("selected");
+      });
+    }
+    
+    // 全生徒リスト更新（※選択状態を保持するため、更新前の選択IDを取得して再適用）
+    function updateStudentList(data) {
+      const container = document.getElementById("studentsContainer");
+      const prevSelected = getSelectedIds();
+      container.innerHTML = "";
+      studentCanvases = {}; studentCards = {}; studentTitles = {};
+      for (let studentId in data) {
+        createStudentCard(studentId, data[studentId]);
+      }
+      // 以前選択されていたIDを再適用
+      prevSelected.forEach(id => {
+        if (studentCards[id]) {
+          studentCards[id].classList.add("selected");
+        }
+      });
+    }
+    function getSelectedIds() {
+      const arr = [];
+      for (let studentId in studentCards) {
+        if (studentCards[studentId].classList.contains("selected")) {
+          arr.push(studentId);
+        }
+      }
+      return arr;
+    }
+    function updateNameVisibility() {
+      for (let studentId in studentTitles) {
+        if (hideNames) {
+          studentTitles[studentId].textContent = "";
+        } else {
+          studentTitles[studentId].textContent = `ID: ${studentId}`;
+        }
+      }
+    }
+    function showSelectedBoards(roomData) {
+      const sel = getSelectedIds();
+      displayContainer.innerHTML = "";
+      sel.forEach(studentId => {
+        const wrap = document.createElement("div");
+        const c = document.createElement("canvas");
+        c.width = 400;
+        c.height = 300;
+        c.classList.add("displayCanvas");
+        wrap.appendChild(c);
+        displayContainer.appendChild(wrap);
+        const dCtx = c.getContext("2d");
+        dCtx.fillStyle = "#ffffff";
+        dCtx.fillRect(0, 0, 400, 300);
+        const allData = roomData[studentId] || {};
+        if (allData.photos && Array.isArray(allData.photos)) {
+          allData.photos.forEach(ph => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => {
+              const w = ph.width * ph.scale * (400 / 800);
+              const h = ph.height * ph.scale * (300 / 600);
+              const x = ph.x * (400 / 800);
+              const y = ph.y * (300 / 600);
+              dCtx.drawImage(img, x, y, w, h);
+            };
+            img.src = ph.imgSrc;
+          });
+        }
+        if (allData.paths && Array.isArray(allData.paths)) {
+          allData.paths.forEach(path => {
+            dCtx.lineCap = "round";
+            if (path.color === "white") {
+              dCtx.globalCompositeOperation = "destination-out";
+              dCtx.lineWidth = 8;
+            } else {
+              dCtx.globalCompositeOperation = "source-over";
+              dCtx.lineWidth = 3;
+              dCtx.strokeStyle = path.color;
+            }
+            dCtx.beginPath();
+            if (!path.points || path.points.length === 0) return;
+            dCtx.moveTo(path.points[0].x * (400 / 800), path.points[0].y * (300 / 600));
+            for (let i = 1; i < path.points.length; i++) {
+              dCtx.lineTo(path.points[i].x * (400 / 800), path.points[i].y * (300 / 600));
+            }
+            dCtx.stroke();
+          });
+        }
+        if (!hideNames) {
+          dCtx.font = "16px sans-serif";
+          dCtx.fillStyle = "rgba(0,0,0,0.3)";
+          dCtx.fillText(studentId, 10, 20);
+        }
+      });
+    }
+    // 定期的に getAllData 要求（5秒ごと）
+    setInterval(() => {
+      if (roomID && teacherID) {
+        socket.emit("getAllData", roomID);
+      }
+    }, 5000);
+    
+    /*********************
+     * Undo/Redo
+     *********************/
+    function recordSnapshot() {
+      let snap = JSON.parse(JSON.stringify({ paths, photoObjs, selectRect }));
+      undoStack.push(snap);
+      redoStack = [];
+    }
+    function undoLocal() {
+      if (undoStack.length < 2) return;
+      let popped = undoStack.pop();
+      redoStack.push(popped);
+      let prev = undoStack[undoStack.length - 1];
+      applySnapshot(prev);
+    }
+    function redoLocal() {
+      if (redoStack.length < 1) return;
+      let popped = redoStack.pop();
+      undoStack.push(popped);
+      applySnapshot(popped);
+    }
+    function applySnapshot(snap) {
+      paths = JSON.parse(JSON.stringify(snap.paths));
+      photoObjs = JSON.parse(JSON.stringify(snap.photoObjs));
+      photoObjs.forEach(photo => {
+        if (photo.imgSrc) {
+          let img = new Image();
+          img.src = photo.imgSrc;
+          photo.img = img;
+        }
+      });
+      selectRect = snap.selectRect ? { ...snap.selectRect } : null;
+      redraw();
+    }
+    function clearLocal() {
+      if (!joined || isLocked) return;
+      recordSnapshot();
+      paths = [];
+      photoObjs = [];
+      selectRect = null;
+      redraw();
+      recordSnapshot();
+    }
+    
+    /*********************
+     * ヘルパー関数
+     *********************/
+    function isInRect(pt, rect) {
+      let x1 = rect.w >= 0 ? rect.x : rect.x + rect.w;
+      let y1 = rect.h >= 0 ? rect.y : rect.y + rect.h;
+      let w = Math.abs(rect.w), h = Math.abs(rect.h);
+      return (pt.x >= x1 && pt.x <= x1 + w && pt.y >= y1 && pt.y <= y1 + h);
+    }
+    function getLineBoundingBox(path) {
+      let xs = path.points.map(p => p.x);
+      let ys = path.points.map(p => p.y);
+      let minx = Math.min(...xs), maxx = Math.max(...xs);
+      let miny = Math.min(...ys), maxy = Math.max(...ys);
+      return { x: minx, y: miny, w: maxx - minx, h: maxy - miny };
+    }
+    function isRectFullyInsideRect(r1, r2) {
+      let x1 = r1.x, y1 = r1.y, w1 = r1.w, h1 = r1.h;
+      let x2 = r2.x, y2 = r2.y, w2 = r2.w, h2 = r2.h;
+      if (w2 < 0) { x2 += w2; w2 = -w2; }
+      if (h2 < 0) { y2 += h2; h2 = -h2; }
+      if (w1 < 0) { x1 += w1; w1 = -w1; }
+      if (h1 < 0) { y1 += h1; h1 = -h1; }
+      return (x1 >= x2 && (x1 + w1) <= (x2 + w2) && y1 >= y2 && (y1 + h1) <= (y2 + h2));
+    }
+    
+    // 定期的に線データを送信（5秒ごと）
+    setInterval(() => {
+      console.log("Emitting syncPaths:", paths);
+      if (!joined || isLocked) return;
+      socket.emit("syncPaths", { roomID, studentId: userID, allPaths: paths });
+    }, 5000);
+    
+    // ----- LOCK STATE パッチ（児童側更新コード） -----
+    socket.on("lockState", ({ studentId, locked }) => {
+      console.log("lockState received:", studentId, locked);
+      if (studentId === userID) {
+        isLocked = locked;
+        redraw();
+      }
+    });
+    
+    // 起動時
+    recordSnapshot();
+    redraw();
+  </script>
+</body>
+</html>
