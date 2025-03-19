@@ -114,7 +114,6 @@ io.on("connection", (socket) => {
     locksByRoom[roomID][studentId] = locked;
     io.to(roomID).emit("lockState", { studentId, locked });
     console.log(`[lock] room=${roomID}, student=${studentId}, locked=${locked}`);
-    // ※ここで、ロックイベントが送信されたときの状態を確認できます
   });
 
   socket.on("resetRoom", (roomID) => {
@@ -123,6 +122,8 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(3000, () => {
-  console.log("✅ サーバー起動: http://localhost:3000");
+// Render でデプロイする場合、process.env.PORT が自動的に設定されるのでそれを使います
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`✅ サーバー起動: http://localhost:${PORT}`);
 });
